@@ -57,6 +57,17 @@ public final class McAutoBridge {
         Path out = Path.of(LetMeSeeSee.EXPORT_DIR_PATH, (modid.isEmpty() ? "all" : modid) + "_entity.json");
         Files.createDirectories(out.getParent());
 
+        // 预热：第一个实体渲染时常带上世界加载后的残留 GL 状态（实测祸殃出现 atlas 残影）。
+        // 先渲一个丢弃，后面就干净了。
+        var warmup = BuiltInRegistries.ENTITY_TYPE.entrySet().stream()
+                .map(Map.Entry::getValue).findFirst().orElse(null);
+        if (warmup != null) {
+            try {
+                EntityRenders.exportEntity(warmup, 32);
+            } catch (Throwable ignored) {
+            }
+        }
+
         int count = 0, noVisual = 0, suspect = 0;
         try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
             for (Map.Entry<ResourceKey<EntityType<?>>, EntityType<?>> e
@@ -104,6 +115,14 @@ public final class McAutoBridge {
                 var large = new EntityRenders.Result("", 0f, 0f);
                 try {
                     large = EntityRenders.exportEntity(type, ICON_LARGE);
+                    // 扁平四边形多半是「模型被拉成平面」，从侧面（+90°）再渲一次往往能看到真实轮廓
+                    if ("flat-quad".equals(large.suspectDetail())) {
+                        var retry = EntityRenders.exportEntity(type, ICON_LARGE,
+                                com.xkball.let_me_see_see.client.offscreen.EntityRenders.DEFAULT_YAW + 90f);
+                        if (!retry.png.isEmpty() && retry.suspectDetail().isEmpty()) {
+                            large = retry;
+                        }
+                    }
                 } catch (Throwable t) {
                     LOGGER.warn("实体 {} 渲染失败: {}", id, t.toString());
                 }

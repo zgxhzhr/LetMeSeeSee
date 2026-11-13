@@ -30,7 +30,7 @@ import java.util.Base64;
 @OnlyIn(Dist.CLIENT)
 public final class EntityRenders {
 
-    private static final float DEFAULT_YAW = 25.0f;
+    public static final float DEFAULT_YAW = 25.0f;
     private static final float RENDER_MARGIN = 1.75f;
     private static final float PADDING = 0.06f;
 
@@ -109,6 +109,10 @@ public final class EntityRenders {
     }
 
     public static Result exportEntity(EntityType<?> type, int size) {
+        return exportEntity(type, size, DEFAULT_YAW);
+    }
+
+    public static Result exportEntity(EntityType<?> type, int size, float yaw) {
         var mc = Minecraft.getInstance();
         if (mc.level == null) {
             return new Result("", 0f, 0f);
@@ -120,7 +124,7 @@ public final class EntityRenders {
         var fbo = new OffScreenFBO(size, size);
         Result r;
         try {
-            fbo.renderOffScreen(() -> renderEntity(probe, fbo.getWidth(), fbo.getHeight(), RENDER_MARGIN));
+            fbo.renderOffScreen(() -> renderEntity(probe, fbo.getWidth(), fbo.getHeight(), RENDER_MARGIN, yaw));
             var raw = fbo.getRenderResult();
             raw.flipY();
             float[] stats = analyze(raw);
@@ -278,6 +282,10 @@ public final class EntityRenders {
     }
 
     public static void renderEntity(Entity entity, int width, int height, float margin) {
+        renderEntity(entity, width, height, margin, DEFAULT_YAW);
+    }
+
+    public static void renderEntity(Entity entity, int width, int height, float margin, float yaw) {
         var mc = Minecraft.getInstance();
         if (mc.level == null || entity == null) {
             return;
@@ -309,7 +317,7 @@ public final class EntityRenders {
         poseStack.pushPose();
         poseStack.translate(width / 2f, height * 0.78f, 0f);
         poseStack.scale(pxPerBlock, -pxPerBlock, pxPerBlock);
-        poseStack.mulPose(Axis.YP.rotationDegrees(DEFAULT_YAW));
+        poseStack.mulPose(Axis.YP.rotationDegrees(yaw));
 
         try {
             // 不用 Lighting.setupForEntityInInventory：实测会把 atlas 状态带进来，
