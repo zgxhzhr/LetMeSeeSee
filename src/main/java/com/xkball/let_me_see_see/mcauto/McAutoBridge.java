@@ -122,6 +122,12 @@ public final class McAutoBridge {
                     }
                     o.addProperty("Icon", large.png);
                     o.addProperty("IconSmall", small);
+                    // 量化指标：图标质量的判据来源，也给下游做二次筛选
+                    o.addProperty("iconCoverage", Math.round(large.coverage*100)/100f);
+                    o.addProperty("iconColorStd", Math.round(large.colorStd*10)/10f);
+                    o.addProperty("iconAspect", Math.round(large.bboxAspect*100)/100f);
+                    o.addProperty("iconFill", Math.round(large.bboxFill*100)/100f);
+                    o.addProperty("iconSizeRatio", Math.round(large.sizeRatio*100)/100f);
                     if (!large.renderer.isEmpty()) {
                         o.addProperty("renderer", large.renderer);
                         if (large.customRenderer) {
@@ -129,8 +135,10 @@ public final class McAutoBridge {
                         }
                     }
                     // 画满整屏 / 单色块 —— 多半是该实体的渲染器依赖额外状态，图标不可信
-                    if (large.suspect()) {
+                    String why = large.suspectDetail();
+                    if (!why.isEmpty()) {
                         o.addProperty("suspect", true);
+                        o.addProperty("suspectReason", why);
                         o.addProperty("iconCoverage", Math.round(large.coverage * 100) / 100f);
                         o.addProperty("iconColorStd", Math.round(large.colorStd * 10) / 10f);
                         suspect++;

@@ -48,14 +48,63 @@ public final class EntityRenders {
             this.colorStd = colorStd;
         }
 
+        /** 可见区包围盒宽高比（w/h）；人形约 0.3~0.7，扁平四边形接近 1 */
+        public float bboxAspect = 1f;
+        /** 可见像素在包围盒内的填充率；实心四边形接近 1，立体模型约 0.3~0.6 */
+        public float bboxFill = 1f;
+        /** 可见区尺寸 / 按包围盒推算的期望尺寸；远大于 1 说明模型尺寸与碰撞箱不符 */
+        public float sizeRatio = 1f;
+
         /** 渲染器类名，便于判断是否自定义渲染器 */
         public String renderer = "";
         /** 自定义渲染器（不在 net.minecraft 包下）：更容易依赖特定渲染状态 */
         public boolean customRenderer = false;
 
-        /** 判定「这个图标不可信」：画满屏或单色块 */
+        /** 判定依据（命中哪条规则），空串表示正常 */
+        public String suspectReason = "";
+
+        /**
+         * 判定「这个图标不可信」。
+         *
+         * 阈值是在 Touhou Little Maid Personality 的 9 个实体上量出来的（样本小，见下），
+         * 每条都对应一类已知的画崩形态：
+         *
+         *   画满屏      coverage > 0.85
+         *               渲染器把东西画成铺满整个画面
+         *   单色块      colorStd < 6
+         *               没有贴图/纯色填充
+         *   扁平四边形  std < 32 且 aspect ∈ [0.85, 1.25]
+         *               实测 starflame_ray：射线按长度拉伸成一块近方形大平面，
+         *               颜色变化低（std 29）但又有纹理，所以抓不到前两条
+         *   极扁长      aspect > 3.0
+         *               实测 maid_broom：模型横躺，宽高比 3.86
+         *
+         * 量到的对照值：hoyi std 37.9 aspect 0.58 / lost_fairy 56.6, 0.69 /
+         *              spring_flower_arrow 59.4, 1.19 —— 三者都不会被误判。
+         *
+         * ⚠️ 样本只有 5 个可见实体，换模组后可能需要调整；误判就用 _icons 手工覆盖。
+         */
+        public String suspectDetail() {
+            if (png.isEmpty()) {
+                return "";
+            }
+            if (coverage > 0.85f) {
+                return "coverage";
+            }
+            if (colorStd < 6f) {
+                return "flat-color";
+            }
+            if (colorStd < 32f && bboxAspect >= 0.85f && bboxAspect <= 1.25f) {
+                return "flat-quad";
+            }
+            if (bboxAspect > 3.0f) {
+                return "extreme-aspect";
+            }
+            return "";
+        }
+
         public boolean suspect() {
-            return !png.isEmpty() && (coverage > 0.85f || colorStd < 6f);
+            return !suspectDetail().isEmpty();
         }
     }
 
@@ -80,6 +129,13 @@ public final class EntityRenders {
                     ? ""
                     : Base64.getEncoder().encodeToString(normalized.asByteArray());
             r = new Result(png, stats[0], stats[1]);
+            r.bboxAspect = stats[2];
+            r.bboxFill = stats[3];
+            // 可见区最长边 vs 按碰撞箱推算的期望像素：模型明显比碰撞箱大 = 渲染不受控
+            float bbMax = Math.max(Math.max(probe.getBbHeight(), 0.4f), Math.max(probe.getBbWidth(), 0.4f));
+            float expectedPx = size / (bbMax * RENDER_MARGIN) * bbMax;   // = size / margin
+            float actualPx = Math.max(stats[4], stats[5]);
+            r.sizeRatio = actualPx / Math.max(expectedPx, 0.001f);
         } catch (Throwable t) {
             r = new Result("", 0f, 0f);
         } finally {
@@ -103,7 +159,7 @@ public final class EntityRenders {
         return exportEntity(type, size).png;
     }
 
-    /** @return {coverage, colorStd} */
+    /** @return {coverage, colorStd, bboxAspect, bboxFill, bboxW, bboxH} */
     private static float[] analyze(NativeImage img) {
         int w = img.getWidth();
         int h = img.getHeight();
@@ -124,14 +180,32 @@ public final class EntityRenders {
             }
         }
         if (opaque == 0) {
-            return new float[]{0f, 0f};
+            return new float[]{0f, 0f, 1f, 1f, 0f, 0f};
         }
         double n = opaque;
         double varR = Math.max(0, sR2 / n - (sR / n) * (sR / n));
         double varG = Math.max(0, sG2 / n - (sG / n) * (sG / n));
         double varB = Math.max(0, sB2 / n - (sB / n) * (sB / n));
         double std = Math.sqrt((varR + varG + varB) / 3.0);
-        return new float[]{(float) opaque / total, (float) std};
+
+        // 包围盒与填充率
+        int minX = w, minY = h, maxX = -1, maxY = -1;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int a = (img.getPixelRGBA(x, y) >>> 24) & 0xFF;
+                if (a > 8) {
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        int bw = Math.max(1, maxX - minX + 1);
+        int bh = Math.max(1, maxY - minY + 1);
+        float aspect = bw / (float) bh;
+        float fill = opaque / (float) (bw * bh);
+        return new float[]{(float) opaque / total, (float) std, aspect, fill, bw, bh};
     }
 
     private static NativeImage normalize(NativeImage src, int size) {
