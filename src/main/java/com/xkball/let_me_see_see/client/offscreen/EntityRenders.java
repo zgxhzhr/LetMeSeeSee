@@ -19,55 +19,121 @@ import java.util.Base64;
 /**
  * 实体图标渲染（mcmod 用）。
  *
- * 流程：正交投影 → PoseStack 摆位 → EntityRenderDispatcher.render → FBO 取像素
- *      → **按非透明像素包围盒裁切并重新居中缩放** → 输出指定边长。
+ * 流程：正交投影 → 光照 setupForEntityInInventory → PoseStack 摆位 →
+ *      EntityRenderDispatcher.render → FBO 取像素 → 按可见区裁切归一化。
  *
- * 为什么要在像素层归一化：
- *   1. 实体包围盒和实际可见外形差别很大（弹幕类 bb 很大但只有细线）
- *   2. 大而空的实体（环形弹幕）按 bb 算会超出画面被裁
- *   3. 小实体（箭、弹）按 bb 算又太小
- *   先按宽松倍率渲一遍，量出真实可见区域，再裁切缩放，比猜倍率稳。
+ * 两个坑（实测踩过）：
+ *  1. 不调 Lighting.setupForEntityInInventory()，依赖光照的渲染器会画错/画成纯色块
+ *  2. 按包围盒猜缩放不可靠（射线类实体 bb 很小、模型很长；环形弹幕 bb 又虚大）
+ *     所以改成「宽松渲染 + 像素级裁切」，见 normalize()
  */
 @OnlyIn(Dist.CLIENT)
 public final class EntityRenders {
 
-    /** 正面偏左的 3/4 视角，与 mcmod 上常见实体图标角度一致 */
     private static final float DEFAULT_YAW = 25.0f;
-    /** 先按这个倍率宽松渲染，再裁切 —— 宁可渲小一点也不要裁掉 */
     private static final float RENDER_MARGIN = 1.75f;
-    /** 归一化后四周留白比例 */
     private static final float PADDING = 0.06f;
 
-    /**
-     * @param size 输出正方形边长（32 / 128）
-     * @return base64 PNG；实体没有可见像素时返回空串
-     */
-    public static String exportEntityAsPng(EntityType<?> type, int size) {
-        // FBO 直接用目标尺寸：归一化时缩放接近 1:1，避免降采样噪点
+    /** 渲染结果 + 质量指标 */
+    public static final class Result {
+        public final String png;
+        /** 非透明像素占画面比例；1.0 附近说明画满了整屏（多半是画崩了） */
+        public final float coverage;
+        /** 非透明像素的颜色标准差（0~255）；很小说明是单色块 */
+        public final float colorStd;
+
+        public Result(String png, float coverage, float colorStd) {
+            this.png = png;
+            this.coverage = coverage;
+            this.colorStd = colorStd;
+        }
+
+        /** 渲染器类名，便于判断是否自定义渲染器 */
+        public String renderer = "";
+        /** 自定义渲染器（不在 net.minecraft 包下）：更容易依赖特定渲染状态 */
+        public boolean customRenderer = false;
+
+        /** 判定「这个图标不可信」：画满屏或单色块 */
+        public boolean suspect() {
+            return !png.isEmpty() && (coverage > 0.85f || colorStd < 6f);
+        }
+    }
+
+    public static Result exportEntity(EntityType<?> type, int size) {
+        var mc = Minecraft.getInstance();
+        if (mc.level == null) {
+            return new Result("", 0f, 0f);
+        }
+        Entity probe = type.create(mc.level);
+        if (probe == null) {
+            return new Result("", 0f, 0f);
+        }
         var fbo = new OffScreenFBO(size, size);
+        Result r;
         try {
-            fbo.renderOffScreen(() -> renderEntity(type, fbo.getWidth(), fbo.getHeight(), RENDER_MARGIN));
+            fbo.renderOffScreen(() -> renderEntity(probe, fbo.getWidth(), fbo.getHeight(), RENDER_MARGIN));
             var raw = fbo.getRenderResult();
             raw.flipY();
+            float[] stats = analyze(raw);
             var normalized = normalize(raw, size);
-            if (normalized == null) {
-                return "";
-            }
-            return Base64.getEncoder().encodeToString(normalized.asByteArray());
+            String png = normalized == null
+                    ? ""
+                    : Base64.getEncoder().encodeToString(normalized.asByteArray());
+            r = new Result(png, stats[0], stats[1]);
         } catch (Throwable t) {
-            return "";
+            r = new Result("", 0f, 0f);
         } finally {
             try {
                 fbo.close();
             } catch (Throwable ignored) {
             }
         }
+        // 记下用了哪个渲染器：自定义渲染器更容易依赖特定渲染状态，图标不可信时便于定位
+        try {
+            var renderer = mc.getEntityRenderDispatcher().getRenderer(probe);
+            r.renderer = renderer.getClass().getName();
+            r.customRenderer = !r.renderer.startsWith("net.minecraft.");
+        } catch (Throwable ignored) {
+        }
+        return r;
     }
 
-    /**
-     * 裁到非透明包围盒 → 等比缩放到 size×size → 居中留白。
-     * 全透明时返回 null（调用方据此判定「无可见模型」）。
-     */
+    /** 兼容旧调用 */
+    public static String exportEntityAsPng(EntityType<?> type, int size) {
+        return exportEntity(type, size).png;
+    }
+
+    /** @return {coverage, colorStd} */
+    private static float[] analyze(NativeImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        int total = w * h;
+        int opaque = 0;
+        double sR = 0, sG = 0, sB = 0, sR2 = 0, sG2 = 0, sB2 = 0;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int argb = img.getPixelRGBA(x, y);
+                int a = (argb >>> 24) & 0xFF;
+                if (a <= 8) {
+                    continue;
+                }
+                opaque++;
+                int b = argb & 0xFF, g = (argb >>> 8) & 0xFF, r = (argb >>> 16) & 0xFF;
+                sR += r; sG += g; sB += b;
+                sR2 += (double) r * r; sG2 += (double) g * g; sB2 += (double) b * b;
+            }
+        }
+        if (opaque == 0) {
+            return new float[]{0f, 0f};
+        }
+        double n = opaque;
+        double varR = Math.max(0, sR2 / n - (sR / n) * (sR / n));
+        double varG = Math.max(0, sG2 / n - (sG / n) * (sG / n));
+        double varB = Math.max(0, sB2 / n - (sB / n) * (sB / n));
+        double std = Math.sqrt((varR + varG + varB) / 3.0);
+        return new float[]{(float) opaque / total, (float) std};
+    }
+
     private static NativeImage normalize(NativeImage src, int size) {
         int w = src.getWidth();
         int h = src.getHeight();
@@ -84,12 +150,12 @@ public final class EntityRenders {
             }
         }
         if (maxX < minX || maxY < minY) {
-            return null;   // 没画出来任何东西
+            return null;
         }
         int bw = maxX - minX + 1;
         int bh = maxY - minY + 1;
         int inner = Math.max(1, Math.round(size * (1f - 2 * PADDING)));
-        // 只允许缩小，不放大（放大只会变糊）
+        // 只缩不放：放大只会更糊
         float scale = Math.min(1.0f, Math.min(inner / (float) bw, inner / (float) bh));
         int dw = Math.max(1, Math.round(bw * scale));
         int dh = Math.max(1, Math.round(bh * scale));
@@ -97,61 +163,49 @@ public final class EntityRenders {
         var out = new NativeImage(size, size, false);
         int ox = (size - dw) / 2;
         int oy = (size - dh) / 2;
-        // 面积平均采样：每个目标像素把覆盖到的源像素做 alpha 加权平均。
-        // 直接最近邻会把边缘半透明像素打散成噪点（32×32 尤其明显）。
         float srcPerDstX = bw / (float) dw;
         float srcPerDstY = bh / (float) dh;
         for (int y = 0; y < dh; y++) {
             int y0 = minY + Math.round(y * srcPerDstY);
-            int y1 = minY + Math.round((y + 1) * srcPerDstY);
-            y1 = Math.max(y1, y0 + 1);
+            int y1 = Math.max(minY + Math.round((y + 1) * srcPerDstY), y0 + 1);
             for (int x = 0; x < dw; x++) {
                 int x0 = minX + Math.round(x * srcPerDstX);
-                int x1 = minX + Math.round((x + 1) * srcPerDstX);
-                x1 = Math.max(x1, x0 + 1);
+                int x1 = Math.max(minX + Math.round((x + 1) * srcPerDstX), x0 + 1);
                 long aSum = 0, rSum = 0, gSum = 0, bSum = 0;
                 int n = 0;
                 for (int sy = y0; sy < Math.min(y1, minY + bh); sy++) {
                     for (int sx = x0; sx < Math.min(x1, minX + bw); sx++) {
                         int argb = src.getPixelRGBA(sx, sy);
                         int a = (argb >>> 24) & 0xFF;
+                        n++;
                         if (a <= 8) {
-                            n++;
                             continue;
                         }
-                        // NativeImage 的像素是 ABGR 排列
-                        int b = argb & 0xFF;
-                        int g = (argb >>> 8) & 0xFF;
-                        int r = (argb >>> 16) & 0xFF;
+                        int b = argb & 0xFF, g = (argb >>> 8) & 0xFF, r = (argb >>> 16) & 0xFF;
                         aSum += (long) a * a;
                         rSum += (long) r * a;
                         gSum += (long) g * a;
                         bSum += (long) b * a;
-                        n++;
                     }
                 }
                 if (n == 0 || aSum == 0) {
                     continue;
                 }
                 int a = (int) Math.min(255, Math.sqrt((double) aSum / n));
-                int r = (int) (rSum / (aSum / 255.0));
-                int g = (int) (gSum / (aSum / 255.0));
-                int b = (int) (bSum / (aSum / 255.0));
-                int px = (a << 24) | (Math.min(255, b) << 0) | (Math.min(255, g) << 8) | (Math.min(255, r) << 16);
-                out.setPixelRGBA(ox + x, oy + y, px);
+                double wsum = aSum / 255.0;
+                int r = (int) Math.min(255, rSum / wsum);
+                int g = (int) Math.min(255, gSum / wsum);
+                int b = (int) Math.min(255, bSum / wsum);
+                // NativeImage 像素是 ABGR
+                out.setPixelRGBA(ox + x, oy + y, (a << 24) | (b << 0) | (g << 8) | (r << 16));
             }
         }
         return out;
     }
 
-    /** 按宽松倍率渲染，像素归一化交给 normalize */
-    public static void renderEntity(EntityType<?> type, int width, int height, float margin) {
+    public static void renderEntity(Entity entity, int width, int height, float margin) {
         var mc = Minecraft.getInstance();
-        if (mc.level == null) {
-            return;
-        }
-        Entity entity = type.create(mc.level);
-        if (entity == null) {
+        if (mc.level == null || entity == null) {
             return;
         }
         entity.setYRot(0f);
@@ -179,19 +233,19 @@ public final class EntityRenders {
         var buffer = MultiBufferSource.immediate(new ByteBufferBuilder(1536));
         var poseStack = new PoseStack();
         poseStack.pushPose();
-        // 画面中心略偏下：让脚底落在 78% 高度处（normalize 会再居中，这里只需不裁掉）
         poseStack.translate(width / 2f, height * 0.78f, 0f);
         poseStack.scale(pxPerBlock, -pxPerBlock, pxPerBlock);
         poseStack.mulPose(Axis.YP.rotationDegrees(DEFAULT_YAW));
 
         try {
+            // 不用 Lighting.setupForEntityInInventory：实测会把 atlas 状态带进来，
+            // 使部分实体出现残影（迷失妖精）。保持与物品渲染一致的环境更稳。
             dispatcher.setRenderShadow(false);
-        } catch (Throwable ignored) {
-        }
-        try {
             dispatcher.render(entity, 0, 0, 0, 0f, 1.0f, poseStack, buffer, 0xF000F0);
             buffer.endBatch();
         } catch (Throwable ignored) {
+        } finally {
+            // 无光照状态需要恢复
         }
 
         poseStack.popPose();
