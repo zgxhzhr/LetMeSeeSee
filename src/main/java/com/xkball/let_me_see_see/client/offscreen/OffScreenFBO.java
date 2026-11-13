@@ -100,6 +100,14 @@ public class OffScreenFBO {
         EXTFramebufferObject.glBindFramebufferEXT(EXTFramebufferObject.GL_FRAMEBUFFER_EXT, oldFBO);
     }
     
+    /** 供一次性导出场景释放 GL 资源（原版只有 private deleteFBO） */
+    public void close() {
+        this.deleteFBO();
+        this.fboID = -1;
+        this.textureID = -1;
+        this.depthRbID = -1;
+    }
+
     private void deleteFBO() {
         GL11.glDeleteTextures(textureID);
         EXTFramebufferObject.glDeleteRenderbuffersEXT(depthRbID);

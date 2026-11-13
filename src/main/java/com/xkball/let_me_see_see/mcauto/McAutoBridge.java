@@ -3,57 +3,49 @@ package com.xkball.let_me_see_see.mcauto;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
+import com.mojang.logging.LogUtils;
 import com.xkball.let_me_see_see.LetMeSeeSee;
 import com.xkball.let_me_see_see.client.offscreen.EntityRenders;
-import com.xkball.let_me_see_see.client.offscreen.OffScreenFBO;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.resources.language.ClientLanguage;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.EntityType;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.api.distmarker.OnlyIn;
+import org.slf4j.Logger;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
-import org.slf4j.Logger;
-import com.mojang.logging.LogUtils;
 
 /**
  * 给自动化用（mcauto agent）的入口。**必须在渲染线程调用**。
  *
- * 为什么单独开类：agent 是独立 jar 通过反射调用的，不想依赖 GUI 那个 Screen 的构造
- * 与字段初始化（ImageSize 等），也不想让 agent 自己做语言切换与图标编码。
- *
  * 输出与 LMS 的「按 mcmod 格式导出」一致：
- *   <EXPORT_DIR_PATH>/<modid>.json        物品（由原 Screen 负责）
+ *   <EXPORT_DIR_PATH>/<modid>.json        物品（原 Screen 负责）
  *   <EXPORT_DIR_PATH>/<modid>_entity.json 实体（本类新增）
  *
- * 实体条目沿用 IRR 的字段名（mcmod 侧按这个格式读）：
- *   {"name": 中文名, "Englishname": 英文名, "mod": 命名空间,
- *    "registerName": "modid:path", "Icon": base64 PNG}
+ * 实体条目沿用 IRR 的字段名，另加两个我们自己用的：
+ *   name / Englishname / mod / registerName / Icon(base64 128×128)
+ *   IconSmall  32×32 base64
+ *   noVisual   true 表示该实体渲染不出任何像素（弹幕、座位、伤害源之类），
+ *              下游不要把它当图标用
  */
 @OnlyIn(Dist.CLIENT)
 public final class McAutoBridge {
 
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
-
-    /** 实体图标两档尺寸，跟物品一致 */
-    private static final int ICON_SMALL = 32;
     private static final int ICON_LARGE = 128;
+    private static final int ICON_SMALL = 32;
 
-    /**
-     * 导出某个命名空间的全部实体。
-     *
-     * @param modid 命名空间（留空表示全部）
-     * @return 写出的文件路径；没有实体时返回 null
-     */
     public static String exportEntities(String modid) throws IOException {
         var mc = Minecraft.getInstance();
         if (mc.level == null) {
@@ -65,10 +57,9 @@ public final class McAutoBridge {
         Path out = Path.of(LetMeSeeSee.EXPORT_DIR_PATH, (modid.isEmpty() ? "all" : modid) + "_entity.json");
         Files.createDirectories(out.getParent());
 
-        OffScreenFBO large = new OffScreenFBO(ICON_LARGE, ICON_LARGE);
-        int count = 0;
+        int count = 0, noVisual = 0;
         try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
-            for (Map.Entry<net.minecraft.resources.ResourceKey<EntityType<?>>, EntityType<?>> e
+            for (Map.Entry<ResourceKey<EntityType<?>>, EntityType<?>> e
                     : BuiltInRegistries.ENTITY_TYPE.entrySet()) {
                 ResourceLocation id = e.getKey().location();
                 if (!modid.isEmpty() && !id.getNamespace().equals(modid)) {
@@ -77,23 +68,56 @@ public final class McAutoBridge {
                 EntityType<?> type = e.getValue();
                 String descId = type.getDescriptionId();
                 JsonObject o = new JsonObject();
-                o.addProperty("name", zh.getOrDefault(descId));
-                o.addProperty("Englishname", en.getOrDefault(descId));
+                o.addProperty("name", resolve(zh, descId));
+                o.addProperty("Englishname", resolve(en, descId));
                 o.addProperty("mod", id.getNamespace());
                 o.addProperty("registerName", id.toString());
+
+                String large = "";
                 try {
-                    o.addProperty("Icon", EntityRenders.exportEntityAsPng(large, type, 1.0f));
+                    large = EntityRenders.exportEntityAsPng(type, ICON_LARGE);
                 } catch (Throwable t) {
                     LOGGER.warn("实体 {} 渲染失败: {}", id, t.toString());
+                }
+                if (large.isEmpty()) {
+                    // 渲不出东西：要么没有可见模型，要么渲染抛错。两种都不该被当图标用
                     o.addProperty("Icon", "");
+                    o.addProperty("IconSmall", "");
+                    o.addProperty("noVisual", true);
+                    noVisual++;
+                } else {
+                    String small;
+                    try {
+                        small = EntityRenders.exportEntityAsPng(type, ICON_SMALL);
+                    } catch (Throwable t) {
+                        small = "";
+                    }
+                    o.addProperty("Icon", large);
+                    o.addProperty("IconSmall", small);
                 }
                 w.write(GSON.toJson(o));
                 w.newLine();
                 count++;
             }
         }
-        LOGGER.info("mcauto: 导出 {} 个实体 → {}", count, out);
+        LOGGER.info("mcauto: 导出 {} 个实体（{} 个无可见模型）→ {}", count, noVisual, out);
         return count > 0 ? out.toString() : null;
+    }
+
+    /**
+     * 取本地化名。有些实体只注册了 entity.xxx.name 而不是 entity.xxx，
+     * 直接 getOrDefault 会吐出原始 lang 键，看起来像 bug。
+     */
+    private static String resolve(ClientLanguage lang, String descId) {
+        String n = lang.getOrDefault(descId);
+        if (n == null || n.startsWith("entity.") || n.startsWith("item.")) {
+            String alt = lang.getOrDefault(descId + ".name");
+            if (alt != null && !alt.startsWith("entity.") && !alt.startsWith("item.")) {
+                return alt;
+            }
+            return "";
+        }
+        return n;
     }
 
     /** 只报数量，供 agent 判断有没有东西可导 */
